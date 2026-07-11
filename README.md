@@ -1,4 +1,4 @@
-# Geometric Laplace Neural Operator
+# Resolvent Neural Operator
 
 prompts.md for instructions.
 ## Data processing
@@ -46,9 +46,6 @@ parameters:
 
 ```bash
 
-
-conda activate zm_AMG
-cd ICLR_GLNO
 
 ## vertices
 
@@ -143,9 +140,5 @@ python train.py --task=shrec11_simplified --local_rank=1 --config=config_geofno.
 results are saved in logs/task/date/model_time/train.log
 
 ## visualization
-private
-
-haven't rewrite yet.
-
 
 python visulize.py --task=turbulent --local_rank=2 --load_model=GLNO2D_14_11_58,FNO2D_15_43_36,LNO2D_15_49_12,WNO2D_21_50_04 --model_list=GLNO,FNO,LNO,WNO
