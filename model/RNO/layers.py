@@ -2,11 +2,8 @@ import sys
 import os
 import random
 
-from model.GLNO.pointnet import FPSPointNetModule
 import scipy
 import scipy.sparse.linalg as sla
-# ^^^ we NEED to import scipy before torch, or it crashes :(
-# (observed on Ubuntu 20.04 w/ torch 1.6.0 and scipy 1.5.2 installed via conda)
 
 import numpy as np
 import torch
@@ -16,12 +13,10 @@ import torch.nn.functional as F
 from ..geometry import to_basis, from_basis, rotate
 from einops.layers.torch import Rearrange
 
-DEBUG=True#os.getenv('DEBUG_MODE', '0') == '1'
+DEBUG=os.getenv('DEBUG_MODE', '0') == '1'
 
-class Laplace_Transform_Layer(nn.Module):
+class Resolvent_Calculator(nn.Module):
     """
-    Laplace Transform with learnable non-linear basis and learnable system poles and residues on spectral domain.
-
     Inputs:
       - values: (V,C) in the spectral domain
       - L: (V,V) sparse laplacian
@@ -34,28 +29,28 @@ class Laplace_Transform_Layer(nn.Module):
     """
 
     def __init__(self, config):
-        super(Laplace_Transform_Layer, self).__init__()
+        super(Resolvent_Calculator, self).__init__()
         self.C_inout = config["C_width"]
         self.in_channels = config["C_width"]
         self.out_channels = config["C_width"]
-        self.num_sigma = config["glno_sigma"]
-        self.num_poles = config["glno_poles"]
+        self.num_sigma = config["rno_sigma"]
+        self.num_poles = config["rno_poles"]
         
         # self.exp_x2_appr=config['exp_x2_appr']
         # self.gaussian=config['gaussian']
         # self.gaussian_factor=config.get('gaussian_factor',1)
 
-        self.LT_kmin = config.get('k_min',0)
-        self.LT_kmax = config.get('k_max',config['k_eig'])
+        self.RC_kmin = config.get('k_min',0)
+        self.RC_kmax = config.get('k_max',config['k_eig'])
 
-        self.period_norm=config['glno_period_norm']
-        self.aperiod_norm= config['glno_aperiod_norm']
-        self.glno_norm=config['glno_norm']
-        self.period=config.get("glno_period",True)
-        self.aperiod=config.get("glno_aperiod",True)
+        self.period_norm=config['rno_period_norm']
+        self.aperiod_norm= config['rno_aperiod_norm']
+        self.rno_norm=config['rno_norm']
+        self.period=config.get("rno_period",True)
+        self.aperiod=config.get("rno_aperiod",True)
         self.norm_period=NormLayer(self.period_norm,self.C_inout)
         self.norm_aperiod=NormLayer(self.aperiod_norm,self.C_inout)
-        self.norm_glno=NormLayer(self.glno_norm,self.C_inout)
+        self.norm_rno=NormLayer(self.rno_norm,self.C_inout)
 
         self.pole_scale=config.get("pole_scale",None)
         self.residue_scale=config.get("residue_scale",None)
@@ -75,7 +70,7 @@ class Laplace_Transform_Layer(nn.Module):
         self.normalize_evals=config.get("normalize_evals",None)
         self.scale_evals=config.get("scale_evals",None)
         self.sqrt_evals=config.get("sqrt_evals",True)
-        self.normalize_k=self.LT_kmax
+        self.normalize_k=self.RC_kmax
         self.normalize_basis=config.get("normalize_basis",False)
         self.safe_mode=config.get("safe_mode",True)
         self.basis_norm=config.get("basis_norm",1)
@@ -111,8 +106,8 @@ class Laplace_Transform_Layer(nn.Module):
             system_poles: (num_poles, in_channels)
             system_residues: (num_poles, in_channels)
         返回:
-            output_residue1: (batch, K, in_channels)   # periodic
-            output_residue2: (batch, num_poles, sigma, num_eig, in_channels)  # aperiodic
+            output_residue1: (batch, K, in_channels) 
+            output_residue2: (batch, num_poles, sigma, num_eig, in_channels) 
         """
         # 1. 计算 pole_in: (batch, K, in_channels)
         if self.sqrt_evals:
@@ -144,9 +139,6 @@ class Laplace_Transform_Layer(nn.Module):
             Hw = torch.einsum("pc,bskpc->bskpc", system_residues, term1)
             # [batch, sigma*num_eig, numpole, channels]
             
-            # output_residue1 = α * H(λ) (periodic)
-            # output_residue1 = torch.einsum("bkc,bkpc->bkc", x_spec, Hw)
-            # output_residue2 = α * H(μ) (aperiodic)
             output_residue2 = torch.einsum("bskc,bskpc->bpskc", x_spec, -Hw)
             output_residue1= -output_residue2.sum(dim=1)
         else:
@@ -199,12 +191,12 @@ class Laplace_Transform_Layer(nn.Module):
             elif self.num_sigma:
                 x_aperiod=x_aperiod/self.num_sigma #原来没有这个
         
-        x_glno = (x_period if self.period else 0) + (x_aperiod if self.aperiod else 0)
-        # x_glno = torch.nan_to_num(x_glno, nan=0.0)
+        x_rno = (x_period if self.period else 0) + (x_aperiod if self.aperiod else 0)
+        # x_rno = torch.nan_to_num(x_rno, nan=0.0)
         if DEBUG:
-            assert torch.isnan(x_glno).any()==False
+            assert torch.isnan(x_rno).any()==False
         
-        return x_glno
+        return x_rno
     
     def forward(self, x, mass, evals, evecs, geo_feat, pos=None):
         if x.shape[-1] != self.C_inout:
@@ -215,21 +207,21 @@ class Laplace_Transform_Layer(nn.Module):
         # Transform to spectral
         batch_size = x.shape[0] # B N C
 
-        if evals.shape[-1]<self.LT_kmax:
-            raise ValueError("evals.shape[-1]<self.LT_kmax")
+        if evals.shape[-1]<self.RC_kmax:
+            raise ValueError("evals.shape[-1]<self.RC_kmax")
 
         if self.normalize_evals:
             evals = (evals / evals[...,self.normalize_k-1].unsqueeze(-1)) * self.normalize_evals
         elif self.scale_evals:
             evals = evals * self.scale_evals
 
-        # mask = (evals >= self.LT_kmin) & (evals <= self.LT_kmax)
+        # mask = (evals >= self.RC_kmin) & (evals <= self.RC_kmax)
         # mask = mask.squeeze(0)
         # evals = evals[..., mask]
         # evecs = evecs[..., mask]
 
-        evals=evals[...,self.LT_kmin:self.LT_kmax]
-        evecs=evecs[...,self.LT_kmin:self.LT_kmax]       
+        evals=evals[...,self.RC_kmin:self.RC_kmax]
+        evecs=evecs[...,self.RC_kmin:self.RC_kmax]       
         
         x_scale=x.unsqueeze(1) # (B, 1, V, C) 直接与 basis 广播
         basis=None
@@ -254,8 +246,8 @@ class Laplace_Transform_Layer(nn.Module):
         
         x_out=self.cal(x_spec, evals, evecs, basis, pos, geo_feat, self.system_poles, self.system_residues)
             
-        if self.glno_norm:
-            x_out=self.norm_glno(x_out)
+        if self.rno_norm:
+            x_out=self.norm_rno(x_out)
             
         return x_out  ##分开来并不能变好
     
@@ -369,57 +361,15 @@ class NormLayer(nn.Module):
             x = x.squeeze(0)
         return x
 
-class SpatialGradientFeatures(nn.Module):
-    """
-    Compute dot-products between input vectors.
-    Uses a learned complex-linear layer to keep dimension down.
-    """
-    def __init__(self, in_channels, with_gradient_rotations=True):
-        """
-        Parameters:
-            in_channels (int): number of input channels.
-            with_gradient_rotations (bool): whether with gradient rotations. Default True.
-        """
-        super(SpatialGradientFeatures, self).__init__()
-
-        self.in_channels = in_channels
-        self.with_gradient_rotations = with_gradient_rotations
-
-        if self.with_gradient_rotations:
-            self.A_re = nn.Linear(self.in_channels, self.in_channels, bias=False)
-            self.A_im = nn.Linear(self.in_channels, self.in_channels, bias=False)
-        else:
-            self.A = nn.Linear(self.in_channels, self.in_channels, bias=False)
-
-    def forward(self, feat_in):
-        """
-        Input:
-            feat_in (B,Nv,C,2)
-        Output:
-            feat_out (B,Nv,C)
-        """
-        feat_a = feat_in
-
-        if self.with_gradient_rotations:
-            feat_real_b = self.A_re(feat_in[..., 0]) - self.A_im(feat_in[..., 1])
-            feat_img_b = self.A_re(feat_in[..., 0]) + self.A_im(feat_in[..., 1])
-        else:
-            feat_real_b = self.A(feat_in[..., 0])
-            feat_img_b = self.A(feat_in[..., 1])
-
-        feat_out = feat_a[..., 0] * feat_real_b + feat_a[..., 1] * feat_img_b
-
-        return torch.tanh(feat_out)
-
-class GLNOBlock(nn.Module):
+class RNOBlock(nn.Module):
     def __init__(self, idx, config):
-        super(GLNOBlock, self).__init__()
+        super(RNOBlock, self).__init__()
 
         self.C_width = config["C_width"]
         self.idx=idx
 
         # Operator
-        self.LT = Laplace_Transform_Layer(config=config)
+        self.RC = Resolvent_Calculator(config=config)
 
         self.learned_geo_feat=config['learned_geo_feat']
         if self.learned_geo_feat:
@@ -460,58 +410,9 @@ class GLNOBlock(nn.Module):
         
         self.skip=config["skip"]
         
-        self.diffuse_type=config.get("diffuse_type",None)
-        if self.diffuse_type=='hks':
-            self.t=nn.Parameter(torch.rand(self.C_width, dtype=torch.float))
-        elif self.diffuse_type=='wks':
-            self.e_N=nn.Parameter(torch.rand(self.C_width, dtype=torch.float))
-            self.sigma=nn.Parameter(torch.rand(self.C_width, dtype=torch.float))
-        elif self.diffuse_type is not None:
-            raise ValueError("invalid diffuse_type")
-
-        self.with_gradient_features=config.get("with_gradient_features",False)
-        if self.with_gradient_features:
-            self.gradient_features = SpatialGradientFeatures(self.C_width, with_gradient_rotations=config.get("with_gradient_rotations",True))
-
         self.k_max=config.get('k_max',128)
         self.k_min=config.get('k_min',0)
 
-    def spectral_diffuse(self, x, evecs, evals, mass, filter_type, **kwargs):
-        """
-        对顶点特征 x 进行谱域扩散（HKS 或 WKS）。
-
-        参数:
-            x: (N, C) 或 (N, 1) 顶点特征，N 顶点数，C 通道数
-            evecs: (N, K) 前 K 个特征向量（列向量）
-            evals: (K,) 对应的特征值
-            mass: (N,) 顶点质量（对角质量矩阵，用于 L2 内积）
-            filter_type: 字符串，'hks' 或 'wks'
-            **kwargs: 
-                - t: 浮点数（HKS 时间参数）
-                - e_N: 浮点数（WKS 对数能量中心）
-                - sigma: 浮点数（WKS 高斯带宽）
-        返回:
-            x_filtered: (N, C) 扩散后的特征
-        """
-        evals=evals[...,self.k_min:self.k_max]
-        evecs=evecs[...,self.k_min:self.k_max]
-        if filter_type == 'hks':
-            t = kwargs.get('t', 1.0)
-            weights = torch.exp(-evals[:,:,None] * t[None,None,:])          # (K_use,)
-        elif filter_type == 'wks':
-            e_N = kwargs.get('e_N', 0.0)
-            sigma = kwargs.get('sigma', 0.1)
-            # 防止 log(0)
-            log_evals = torch.log(evals + 1e-12)
-            weights = torch.exp(-((e_N[None,None,:] - log_evals[:,:,None]) ** 2) / (2 * sigma[None,None,:] ** 2))
-            # 可选：归一化（与 WKS 一致，但作为滤波器可不做）
-            # weights = weights / weights.sum()
-        else:
-            raise ValueError("filter_type must be 'hks' or 'wks'")
-
-        # 对每个通道进行谱滤波
-        return from_basis(weights*to_basis(x, evecs, mass),evecs)
-        
     def forward(self, x_in, mass, evals, evecs, geo_feat, pos=None, edges=None, **kwargs):
         if x_in.shape[-1] != self.C_width:
             raise ValueError(
@@ -525,7 +426,7 @@ class GLNOBlock(nn.Module):
                 geo_feat=self.last_geo_norm(geo_feat)
             geo_feat=geo_feat.squeeze(-1)
 
-        x_glno = self.LT(x_in, mass, evals, evecs, geo_feat,pos)
+        x_rno = self.RC(x_in, mass, evals, evecs, geo_feat,pos)
         
         if self.high_fre:
             if evecs.shape[-1]<self.k_eig_high_fre:
@@ -534,43 +435,15 @@ class GLNOBlock(nn.Module):
             x_low=from_basis(to_basis(x_in.unsqueeze(1), evecs, mass), evecs).squeeze(1)
             x_high=x_in-x_low
             x_high=self.mlp_high(x_high)
-            x_glno+=x_high
+            x_rno+=x_high
 
-        if self.diffuse_type:
-            x_glno=self.spectral_diffuse(x_glno, evecs, evals, mass, self.diffuse_type, 
-                                         t=self.t if self.diffuse_type=='hks' else None, 
-                                         e_N=self.e_N if self.diffuse_type=='wks' else None, sigma=self.sigma if self.diffuse_type=='wks' else None)
-        
         if DEBUG:
-            assert torch.isnan(x_glno).any()==False, "LT output contains NaN"
+            assert torch.isnan(x_rno).any()==False, "RC output contains NaN"
         
         if len(geo_feat.shape)==2:
             geo_feat=geo_feat.unsqueeze(-1)
             
-        if self.with_gradient_features:
-            # Compute gradient
-            feat_grads = []
-            B = x_in.shape[0]
-            gradX=kwargs.get("gradX",None)
-            gradY=kwargs.get("gradY",None)
-            if gradX is None or gradY is None:
-                raise ValueError("gradX and gradY must be provided when with_gradient_features is True")
-            for b in range(B):
-                # gradient after diffusion
-                feat_gradX = torch.mm(gradX[b, ...], x_glno[b, ...])
-                feat_gradY = torch.mm(gradY[b, ...], x_glno[b, ...])
-
-                feat_grads.append(torch.stack((feat_gradX, feat_gradY), dim=-1))
-                
-            feat_grad = torch.stack(feat_grads, dim=0) # [B, V, C, 2]
-
-            # Compute gradient features
-            feat_grad_features = self.gradient_features(feat_grad)
-
-            # Stack inputs to MLP
-            feature_combined = torch.cat((x_in, feat_grad_features), dim=-1)
-        else:
-            feature_combined = torch.cat((x_in, x_glno), dim=-1) #high还是in好像也no difference， xin比较good #这里加x_high是useless
+        feature_combined = torch.cat((x_in, x_rno), dim=-1)
         feature_combined = self.norm_feature(feature_combined)         
         
         # Apply the connect method
@@ -586,10 +459,10 @@ class GLNOBlock(nn.Module):
         return x0_out
 
 
-class GLNONet(nn.Module):
+class RNONet(nn.Module):
     def __init__(self, config):
         """
-        Construct a GLNONet.
+        Construct a RNONet.
 
         Parameters loaed from config:
             C_in (int):                     input dimension
@@ -603,7 +476,7 @@ class GLNONet(nn.Module):
             diffusion_method (str):      how to evaluate diffusion, one of ['spectral', 'implicit_dense']. If implicit_dense is used, can set k_eig=0, saving precompute.
             """
 
-        super(GLNONet, self).__init__()
+        super(RNONet, self).__init__()
 
         # Load parameters
         self.device=config["device"]
@@ -655,7 +528,7 @@ class GLNONet(nn.Module):
         
         self.blocks = []
         for i_block in range(self.N_block):
-            block = GLNOBlock(i_block,config=config)
+            block = RNOBlock(i_block,config=config)
             self.blocks.append(block)
             self.add_module("block_" + str(i_block), self.blocks[-1])
 
