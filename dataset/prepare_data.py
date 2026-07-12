@@ -9,8 +9,6 @@ from torch.utils.data import Dataset
 from torch_geometric.data import Data
 import potpourri3d as pp3d
 
-import diffusion_net
-from diffusion_net.utils import toNP
 from tqdm import tqdm
 
 class CarCFDBase(Dataset):
